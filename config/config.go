@@ -38,6 +38,8 @@ type Config struct {
 	Tasks                   []*TaskConfig
 	Assignment              Assignment
 	LogLevel                string
+	LogTrace                bool
+	RecordPoolSize          int64
 	ReloadSeriesMapInterval int
 	ActiveSeriesRange       int
 
@@ -46,7 +48,13 @@ type Config struct {
 
 // KafkaConfig configuration parameters
 type KafkaConfig struct {
-	Brokers        string
+	Brokers    string
+	Properties struct {
+		HeartbeatInterval      int `json:"heartbeat.interval.ms"`
+		SessionTimeout         int `json:"session.timeout.ms"`
+		RebalanceTimeout       int `json:"rebalance.timeout.ms"`
+		RequestTimeoutOverhead int `json:"request.timeout.ms"`
+	}
 	ResetSaslRealm bool
 	Security       map[string]string
 	TLS            struct {
@@ -187,8 +195,12 @@ const (
 	defaultLogLevel                = "info"
 	defaultKerberosConfigPath      = "/etc/krb5.conf"
 	defaultMaxOpenConns            = 1
-	defaultReloadSeriesMapInterval = 3600  // 1 hour
-	defaultActiveSeriesRange       = 86400 // 1 day
+	defaultReloadSeriesMapInterval = 3600   // 1 hour
+	defaultActiveSeriesRange       = 86400  // 1 day
+	defaultHeartbeatInterval       = 3000   // 3 s
+	defaultSessionTimeout          = 120000 // 2 min
+	defaultRebalanceTimeout        = 120000 // 2 min
+	defaultRequestTimeoutOverhead  = 60000  // 1 min
 )
 
 func ParseLocalCfgFile(cfgPath string) (cfg *Config, err error) {
@@ -259,6 +271,19 @@ func (cfg *Config) Normallize(constructGroup bool, httpAddr string, cred util.Cr
 			os.Setenv("DOMAIN_REALM", net.JoinHostPort("hadoop."+strings.ToLower(cfg.Kafka.Sasl.GSSAPI.Realm), port))
 		}
 	}
+	if cfg.Kafka.Properties.HeartbeatInterval == 0 {
+		cfg.Kafka.Properties.HeartbeatInterval = defaultHeartbeatInterval
+	}
+	if cfg.Kafka.Properties.RebalanceTimeout == 0 {
+		cfg.Kafka.Properties.RebalanceTimeout = defaultRebalanceTimeout
+	}
+	if cfg.Kafka.Properties.RequestTimeoutOverhead == 0 {
+		cfg.Kafka.Properties.RequestTimeoutOverhead = defaultRequestTimeoutOverhead
+	}
+	if cfg.Kafka.Properties.SessionTimeout == 0 {
+		cfg.Kafka.Properties.SessionTimeout = defaultSessionTimeout
+	}
+
 	if cfg.Clickhouse.RetryTimes < 0 {
 		cfg.Clickhouse.RetryTimes = 0
 	}
@@ -315,6 +340,9 @@ func (cfg *Config) Normallize(constructGroup bool, httpAddr string, cred util.Cr
 				gCfg.Configs[taskCfg.Name] = taskCfg
 			}
 		}
+	}
+	if cfg.RecordPoolSize == 0 {
+		cfg.RecordPoolSize = MaxBufferSize
 	}
 	switch strings.ToLower(cfg.LogLevel) {
 	case "debug", "info", "warn", "error", "dpanic", "panic", "fatal":

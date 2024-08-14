@@ -44,6 +44,17 @@
   // Kafka config
   "kafka": {
     "brokers": "127.0.0.1:9093",
+
+    "properties":{
+        // This corresponds to Kafka's heartbeat.interval.ms.
+        "heartbeat.interval.ms": 3000,
+        // This option corresponds to Kafka's session.timeout.ms setting and must be within the broker's group.min.session.timeout.ms and group.max.session.timeout.ms.
+        "session.timeout.ms": 120000,
+        // This corresponds to Kafka's rebalance.timeout.ms.
+        "rebalance.timeout.ms": 120000,
+        // This option is roughly equivalent to request.timeout.ms, but grants additional time to requests that have timeout fields.
+        "request.timeout.ms": 60000
+    }
   
     // jave client style security authentication
     "security":{
@@ -188,6 +199,9 @@
   // utilization, only active series from the last "activeSeriesRange" seconds will be cached, and the map in the cache will be updated every
   // "reloadSeriesMapInterval" seconds. By default, series from the last 24 hours will be cached, and the cache will be updated every hour.
 	"reloadSeriesMapInterval": 3600,
-	"activeSeriesRange": 86400
+	"activeSeriesRange": 86400,
+  "logTrace": false,
+  // It is recommended that recordPoolSize be 3 or 4 times the bufferSize, for the backpressure mechanism, to avoid using too much memory.
+  "recordPoolSize": 1048576
 }
 ```

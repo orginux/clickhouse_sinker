@@ -49,10 +49,6 @@ var (
 	runner      *task.Sinker
 )
 
-const (
-	HttpPortBase = 10000
-)
-
 func initCmdOptions() {
 	// 1. Set options to default value.
 	cmdOps = util.CmdOptions{
@@ -64,10 +60,12 @@ func initCmdOptions() {
 		NacosGroup:    "DEFAULT_GROUP",
 		NacosUsername: "nacos",
 		NacosPassword: "nacos",
+		Encrypt:       "",
 	}
 
 	// 2. Replace options with the corresponding env variable if present.
 	util.EnvBoolVar(&cmdOps.ShowVer, "v")
+	util.EnvStringVar(&cmdOps.Encrypt, "e")
 	util.EnvStringVar(&cmdOps.LogLevel, "log-level")
 	util.EnvStringVar(&cmdOps.LogPaths, "log-paths")
 	util.EnvIntVar(&cmdOps.HTTPPort, "http-port")
@@ -93,6 +91,7 @@ func initCmdOptions() {
 
 	// 3. Replace options with the corresponding CLI parameter if present.
 	flag.BoolVar(&cmdOps.ShowVer, "v", cmdOps.ShowVer, "show build version and quit")
+	flag.StringVar(&cmdOps.Encrypt, "e", cmdOps.Encrypt, "encrypt password")
 	flag.StringVar(&cmdOps.LogLevel, "log-level", cmdOps.LogLevel, "one of debug, info, warn, error, dpanic, panic, fatal")
 	flag.StringVar(&cmdOps.LogPaths, "log-paths", cmdOps.LogPaths, "a list of comma-separated log file path. stdout means the console stdout")
 	flag.IntVar(&cmdOps.HTTPPort, "http-port", cmdOps.HTTPPort, "http listen port")
@@ -118,6 +117,9 @@ func initCmdOptions() {
 	flag.StringVar(&cmdOps.KafkaGSSAPIPassword, "kafka-gssapi-password", cmdOps.KafkaGSSAPIPassword, "kafka GSSAPI password")
 
 	flag.Parse()
+	if err := util.Gsypt.Unmarshal(&cmdOps); err != nil {
+		util.Logger.Fatal("failed to decrypt password", zap.Error(err))
+	}
 }
 
 func getVersion() string {
@@ -126,6 +128,10 @@ func getVersion() string {
 
 func init() {
 	initCmdOptions()
+	if cmdOps.Encrypt != "" {
+		fmt.Println(util.AesEncryptECB(cmdOps.Encrypt))
+		os.Exit(0)
+	}
 	logPaths := strings.Split(cmdOps.LogPaths, ",")
 	util.InitLogger(logPaths)
 	util.SetLogLevel(cmdOps.LogLevel)
@@ -138,10 +144,27 @@ func init() {
 
 func main() {
 	util.Run("clickhouse_sinker", func() error {
-		// Initialize http server for metrics and debug
-		mux := http.NewServeMux()
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(`
+		httpHost := cmdOps.HTTPHost
+		if httpHost == "" {
+			ip, err := util.GetOutboundIP()
+			if err != nil {
+				return fmt.Errorf("failed to determine outbound ip: %w", err)
+			}
+			httpHost = ip.String()
+		}
+
+		httpPort := cmdOps.HTTPPort
+		if httpPort == 0 {
+			httpPort = util.HttpPortBase
+		}
+		httpPort = util.GetSpareTCPPort(httpPort)
+
+		// cmdOps.HTTPPort=0: disable the http server
+		if cmdOps.HTTPPort > 0 {
+			// Initialize http server for metrics and debug
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`
 				<html><head><title>ClickHouse Sinker</title></head>
 				<body>
 					<h1>ClickHouse Sinker</h1>
@@ -153,59 +176,65 @@ func main() {
 					<p><a href="/live?full=1">Live Full</a></p>
 					<p><a href="/debug/pprof/">pprof</a></p>
 				</body></html>`))
-		})
+			})
 
-		mux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if runner != nil && runner.GetCurrentConfig() != nil {
-				var stateLags map[string]cm.StateLag
-				var bs []byte
-				var err error
-				if stateLags, err = cm.GetTaskStateAndLags(runner.GetCurrentConfig()); err == nil {
-					if bs, err = json.Marshal(stateLags); err == nil {
-						_, _ = w.Write(bs)
+			mux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if runner != nil && runner.GetCurrentConfig() != nil {
+					var stateLags map[string]cm.StateLag
+					var bs []byte
+					var err error
+					if stateLags, err = cm.GetTaskStateAndLags(runner.GetCurrentConfig()); err == nil {
+						if bs, err = json.Marshal(stateLags); err == nil {
+							_, _ = w.Write(bs)
+						}
 					}
 				}
-			}
-		})
-		mux.Handle("/metrics", httpMetrics)
-		mux.HandleFunc("/ready", health.Health.ReadyEndpoint) // GET /ready?full=1
-		mux.HandleFunc("/live", health.Health.LiveEndpoint)   // GET /live?full=1
-		mux.HandleFunc("/debug/pprof/", pprof.Index)
-		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-		mux.Handle("/debug/vars", http.DefaultServeMux)
+			})
+			health.Health.AddLivenessCheck("task", func() error {
+				var err error
+				if runner != nil && runner.GetCurrentConfig() != nil {
+					var stateLags map[string]cm.StateLag
+					var count int
+					if stateLags, err = cm.GetTaskStateAndLags(runner.GetCurrentConfig()); err == nil {
+						for _, value := range stateLags {
+							if value.State == "Dead" {
+								count++
+							}
+						}
+						if count == len(stateLags) {
+							return fmt.Errorf("All task is Dead.")
+						}
+					} else {
+						return err
+					}
+				}
+				return nil
+			})
+			mux.Handle("/metrics", httpMetrics)
+			mux.HandleFunc("/ready", health.Health.ReadyEndpoint) // GET /ready?full=1
+			mux.HandleFunc("/live", health.Health.LiveEndpoint)   // GET /live?full=1
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			mux.Handle("/debug/vars", http.DefaultServeMux)
 
-		// cmdOps.HTTPPort=0: let OS choose the listen port, and record the exact metrics URL to log.
-		httpPort := cmdOps.HTTPPort
-		if httpPort == 0 {
-			httpPort = util.GetSpareTCPPort(HttpPortBase)
-		}
-
-		httpHost := cmdOps.HTTPHost
-		if httpHost == "" {
-			ip, err := util.GetOutboundIP()
+			httpAddr = fmt.Sprintf("%s:%d", httpHost, httpPort)
+			listener, err := net.Listen("tcp", httpAddr)
 			if err != nil {
-				return fmt.Errorf("failed to determine outbound ip: %w", err)
+				return fmt.Errorf("failed to listen on %q: %w", httpAddr, err)
 			}
-			httpHost = ip.String()
+
+			util.Logger.Info(fmt.Sprintf("Run http server at http://%s/", httpAddr))
+
+			go func() {
+				if err := http.Serve(listener, mux); err != nil {
+					util.Logger.Error("http.ListenAndServe failed", zap.Error(err))
+				}
+			}()
 		}
-
-		httpAddr = fmt.Sprintf("%s:%d", httpHost, httpPort)
-		listener, err := net.Listen("tcp", httpAddr)
-		if err != nil {
-			return fmt.Errorf("failed to listen on %q: %w", httpAddr, err)
-		}
-
-		util.Logger.Info(fmt.Sprintf("Run http server at http://%s/", httpAddr))
-
-		go func() {
-			if err := http.Serve(listener, mux); err != nil {
-				util.Logger.Error("http.ListenAndServe failed", zap.Error(err))
-			}
-		}()
 
 		var rcm cm.RemoteConfManager
 		var properties map[string]interface{}

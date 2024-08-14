@@ -71,6 +71,8 @@ type ClickHouse struct {
 
 	distMetricTbls []string
 	distSeriesTbls []string
+	DimSerID       string
+	DimMgmtID      string
 
 	seriesQuota *model.SeriesQuota
 
@@ -126,10 +128,10 @@ func (c *ClickHouse) Drain() {
 }
 
 // Send a batch to clickhouse
-func (c *ClickHouse) Send(batch *model.Batch) {
+func (c *ClickHouse) Send(batch *model.Batch, traceId string) {
 	sc := pool.GetShardConn(batch.BatchIdx)
 	if err := sc.SubmitTask(func() {
-		c.loopWrite(batch, sc)
+		c.loopWrite(batch, sc, traceId)
 		batch.Wg.Done()
 		c.mux.Lock()
 		c.numFlying--
@@ -139,6 +141,8 @@ func (c *ClickHouse) Send(batch *model.Batch) {
 		c.mux.Unlock()
 		statistics.WritingPoolBacklog.WithLabelValues(c.taskCfg.Name).Dec()
 	}); err != nil {
+		batch.Wg.Done()
+		util.Rs.Dec(int64(batch.RealSize))
 		return
 	}
 
@@ -247,9 +251,15 @@ func (c *ClickHouse) write(batch *model.Batch, sc *pool.ShardConn, dbVer *int) (
 }
 
 // LoopWrite will dead loop to write the records
-func (c *ClickHouse) loopWrite(batch *model.Batch, sc *pool.ShardConn) {
+func (c *ClickHouse) loopWrite(batch *model.Batch, sc *pool.ShardConn, traceId string) {
 	var retrycount int
 	var dbVer int
+
+	util.LogTrace(traceId, util.TraceKindWriteStart, zap.Int("realsize", batch.RealSize))
+	defer func() {
+		util.Rs.Dec(int64(batch.RealSize))
+		util.LogTrace(traceId, util.TraceKindWriteEnd, zap.Int("success", batch.RealSize))
+	}()
 	times := c.cfg.Clickhouse.RetryTimes
 	if times <= 0 {
 		times = 0
@@ -274,39 +284,28 @@ func (c *ClickHouse) loopWrite(batch *model.Batch, sc *pool.ShardConn) {
 	}
 }
 
+func (c *ClickHouse) getSeriesDims(dims []*model.ColumnWithType, conn *pool.Conn) {
+	for _, dim := range dims {
+		if strings.Contains(dim.Name, "series_id") {
+			c.DimSerID = dim.Name
+		}
+		if strings.Contains(dim.Name, "mgmt_id") {
+			c.DimMgmtID = dim.Name
+		}
+	}
+}
+
 func (c *ClickHouse) initSeriesSchema(conn *pool.Conn) (err error) {
 	if !c.taskCfg.PrometheusSchema {
 		c.IdxSerID = -1
 		return
 	}
-	// Move column "__series_id" to the last.
-	var dimSerID *model.ColumnWithType
-	for i := 0; i < len(c.Dims); {
-		dim := c.Dims[i]
-		if dim.Name == "__series_id" && dim.Type.Type == model.Int64 {
-			dimSerID = dim
-			c.Dims = append(c.Dims[:i], c.Dims[i+1:]...)
-			break
-		} else {
-			i++
-		}
-	}
-	if dimSerID == nil {
-		err = errors.Newf("Metric table %s.%s shall have column `__series_id UInt64`.", c.dbName, c.TableName)
-		return
-	}
-	c.IdxSerID = len(c.Dims)
-	c.Dims = append(c.Dims, dimSerID)
 
 	// Add string columns from series table
 	if c.seriesTbl == "" {
 		c.seriesTbl = c.TableName + "_series"
 	}
-	expSeriesDims := []*model.ColumnWithType{
-		{Name: "__series_id", Type: &model.TypeInfo{Type: model.Int64}},
-		{Name: "__mgmt_id", Type: &model.TypeInfo{Type: model.Int64}},
-		{Name: "labels", Type: &model.TypeInfo{Type: model.String}},
-	}
+
 	var seriesDims []*model.ColumnWithType
 	if seriesDims, err = getDims(c.dbName, c.seriesTbl, nil, c.taskCfg.Parser, conn); err != nil {
 		if errors.Is(err, ErrTblNotExist) {
@@ -315,6 +314,34 @@ func (c *ClickHouse) initSeriesSchema(conn *pool.Conn) (err error) {
 		}
 		return
 	}
+
+	c.getSeriesDims(seriesDims, conn)
+
+	// Move column "__series_id__" to the last.
+	var dimSerID *model.ColumnWithType
+	for i := 0; i < len(c.Dims); {
+		dim := c.Dims[i]
+		if dim.Name == c.DimSerID && dim.Type.Type == model.Int64 {
+			dimSerID = dim
+			c.Dims = append(c.Dims[:i], c.Dims[i+1:]...)
+			break
+		} else {
+			i++
+		}
+	}
+	if dimSerID == nil {
+		err = errors.Newf("Metric table %s.%s shall have column `%s Int64`.", c.dbName, c.TableName, c.DimSerID)
+		return
+	}
+	c.IdxSerID = len(c.Dims)
+	c.Dims = append(c.Dims, dimSerID)
+
+	expSeriesDims := []*model.ColumnWithType{
+		{Name: c.DimSerID, Type: &model.TypeInfo{Type: model.Int64}},
+		{Name: c.DimMgmtID, Type: &model.TypeInfo{Type: model.Int64}},
+		{Name: "labels", Type: &model.TypeInfo{Type: model.String}},
+	}
+
 	var badFirst bool
 	if len(seriesDims) < len(expSeriesDims) {
 		badFirst = true
@@ -328,7 +355,7 @@ func (c *ClickHouse) initSeriesSchema(conn *pool.Conn) (err error) {
 		}
 	}
 	if badFirst {
-		err = errors.Newf(`First columns of %s are expect to be "__series_id Int64, __mgmt_id Int64, labels String".`, c.seriesTbl)
+		err = errors.Newf(`First columns of %s are expect to be %s Int64, %s Int64, labels String".`, c.seriesTbl, c.DimSerID, c.DimMgmtID)
 		return
 	}
 	c.NameKey = "__name__" // prometheus uses internal "__name__" label for metric name
@@ -423,6 +450,7 @@ func (c *ClickHouse) initSchema() (err error) {
 			})
 		}
 	}
+
 	if err = c.initSeriesSchema(conn); err != nil {
 		return
 	}
@@ -552,8 +580,15 @@ func (c *ClickHouse) ChangeSchema(newKeys *sync.Map) (err error) {
 		return
 	}
 
+	var version string
+	if err = conn.QueryRow("SELECT Version()").Scan(&version); err != nil {
+		return
+	}
 	alterTable := func(tbl, col string) error {
-		query := fmt.Sprintf("ALTER TABLE `%s`.`%s` %s %s;", c.dbName, tbl, onCluster, col)
+		query := fmt.Sprintf("ALTER TABLE `%s`.`%s` %s %s", c.dbName, tbl, onCluster, col)
+		if util.CompareClickHouseVersion(version, "23.3") >= 0 {
+			query += " SETTINGS alter_sync = 0"
+		}
 		util.Logger.Info(fmt.Sprintf("executing sql=> %s", query), zap.String("task", taskCfg.Name))
 		return conn.Exec(query)
 	}

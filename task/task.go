@@ -152,7 +152,7 @@ func (service *Service) Init() (err error) {
 	return
 }
 
-func (service *Service) Put(msg *model.InputMessage, flushFn func()) error {
+func (service *Service) Put(msg *model.InputMessage, traceId string, flushFn func(traceId, with string)) error {
 	taskCfg := service.taskCfg
 	statistics.ConsumeMsgsTotal.WithLabelValues(taskCfg.Name).Inc()
 	var err error
@@ -190,9 +190,11 @@ func (service *Service) Put(msg *model.InputMessage, flushFn func()) error {
 			// 2) flush the shards
 			// 3) apply the schema change.
 			// 4) recreate the service
-			util.Logger.Warn("new key detected, consumer is going to restart", zap.String("consumer group", service.taskCfg.ConsumerGroup), zap.Error(err))
-			go service.consumer.restart()
-			flushFn()
+			if len(service.consumer.grpConfig.Configs) > 1 {
+				util.Logger.Warn("new key detected, consumer is going to restart", zap.String("consumer group", service.taskCfg.ConsumerGroup), zap.Error(err))
+				go service.consumer.restart()
+			}
+			flushFn(traceId, "foundNewKeys and restart")
 			if err = service.clickhouse.ChangeSchema(&service.newKeys); err != nil {
 				util.Logger.Fatal("clickhouse.ChangeSchema failed", zap.String("task", taskCfg.Name), zap.Error(err))
 			}
@@ -209,7 +211,7 @@ func (service *Service) Put(msg *model.InputMessage, flushFn func()) error {
 				util.Logger.Fatal("shard number calculation failed", zap.String("task", taskCfg.Name), zap.Error(err))
 			}
 		} else {
-			msgRow.Shard = int(msgRow.Msg.Offset>>service.offShift) % service.sharder.shards
+			msgRow.Shard = int(msgRow.Msg.Offset * (int64(msgRow.Msg.Partition + 1)) >> service.offShift % int64(service.sharder.shards))
 		}
 		service.sharder.PutElement(&msgRow)
 	}
@@ -219,13 +221,13 @@ func (service *Service) Put(msg *model.InputMessage, flushFn func()) error {
 
 func (service *Service) metric2Row(metric model.Metric, msg *model.InputMessage) (r *model.Row) {
 	if service.idxSerID >= 0 {
-		// If some labels are not Prometheus native, ETL shall calculate and pass "__series_id" and "__mgmt_id".
-		val := metric.GetInt64("__series_id", false)
+		// If some labels are not Prometheus native, ETL shall calculate and pass "__series_id__" and "__mgmt_id__".
+		val := metric.GetInt64(service.clickhouse.DimSerID, false)
 		seriesID := val.(int64)
-		val = metric.GetInt64("__mgmt_id", false)
+		val = metric.GetInt64(service.clickhouse.DimMgmtID, false)
 		mgmtID := val.(int64)
 		newSeries := service.clickhouse.AllowWriteSeries(seriesID, mgmtID)
-		rowcount := service.idxSerID + 1 // including __series_id
+		rowcount := service.idxSerID + 1 // including __series_id__
 		if newSeries {
 			rowcount += (service.numDims - service.idxSerID + 3)
 		}
@@ -234,10 +236,10 @@ func (service *Service) metric2Row(metric model.Metric, msg *model.InputMessage)
 		for i := 0; i < service.idxSerID; i++ {
 			row = append(row, model.GetValueByType(metric, service.dims[i]))
 		}
-		row = append(row, seriesID) // __series_id
+		row = append(row, seriesID) // __series_id__
 		if newSeries {
 			var labels []string
-			row = append(row, mgmtID, nil) // __mgmt_id, labels
+			row = append(row, mgmtID, nil) // __mgmt_id__, labels
 			for i := service.idxSerID + 3; i < service.numDims; i++ {
 				dim := service.dims[i]
 				val := model.GetValueByType(metric, dim)

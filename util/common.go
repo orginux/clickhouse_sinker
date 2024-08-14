@@ -31,6 +31,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
 
+	"github.com/google/uuid"
 	"github.com/thanos-io/thanos/pkg/errors"
 )
 
@@ -38,6 +39,7 @@ var (
 	Logger       *zap.Logger
 	logAtomLevel zap.AtomicLevel
 	logPaths     []string
+	logTrace     bool
 )
 
 type CmdOptions struct {
@@ -60,6 +62,7 @@ type CmdOptions struct {
 	NacosPassword    string
 	NacosDataID      string
 	NacosServiceName string // participate in assignment management if not empty
+	Encrypt          string
 
 	Credentials
 }
@@ -240,7 +243,7 @@ func InitLogger(newLogPaths []string) {
 		zapcore.NewMultiWriteSyncer(syncers...),
 		logAtomLevel,
 	)
-	Logger = zap.New(core, zap.AddStacktrace(zap.ErrorLevel))
+	Logger = zap.New(core, zap.AddStacktrace(zap.ErrorLevel), zap.AddCaller())
 }
 
 func SetLogLevel(newLogLevel string) {
@@ -250,6 +253,34 @@ func SetLogLevel(newLogLevel string) {
 			lvl = zap.InfoLevel
 		}
 		logAtomLevel.SetLevel(lvl)
+	}
+}
+
+func GenTraceId() string {
+	return uuid.NewString()
+}
+
+const (
+	TraceKindFetchStart   string = "fetch start"
+	TraceKindFetchEnd     string = "fetch end"
+	TraceKindProcessStart string = "process start"
+	TraceKindProcessEnd   string = "process end"
+	TraceKindWriteStart   string = "loopwrite start"
+	TraceKindWriteEnd     string = "loopwrite end"
+	TraceKindProcessing   string = "process continue"
+)
+
+func SetLogTrace(enabled bool) {
+	logTrace = enabled
+}
+
+func LogTrace(traceId string, kind string, fields ...zapcore.Field) {
+	if logTrace {
+		allFields := []zapcore.Field{
+			zap.String("trace_id", traceId),
+			zap.String("trace_kind", kind)}
+		allFields = append(allFields, fields...)
+		Logger.Info("===trace===", allFields...)
 	}
 }
 
@@ -316,4 +347,25 @@ func TrySetValue(v1, v2 interface{}) bool {
 		}
 	}
 	return ok
+}
+
+func CompareClickHouseVersion(v1, v2 string) int {
+	s1 := strings.Split(v1, ".")
+	s2 := strings.Split(v2, ".")
+	for i := 0; i < len(s1); i++ {
+		if len(s2) <= i {
+			break
+		}
+		if s1[i] == "x" || s2[i] == "x" {
+			continue
+		}
+		f1, _ := strconv.Atoi(s1[i])
+		f2, _ := strconv.Atoi(s2[i])
+		if f1 > f2 {
+			return 1
+		} else if f1 < f2 {
+			return -1
+		}
+	}
+	return 0
 }
